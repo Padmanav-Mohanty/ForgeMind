@@ -1,0 +1,13 @@
+# ForgeMind data pipeline dependencies (minimal by design).
+#
+# Core pipeline:
+huggingface_hub>=0.23      # AIFaultBench snapshot download
+PyYAML>=6.0                # configs/data_config.yaml
+tqdm>=4.66                 # progress bars (huggingface_hub UI)
+#
+# Used transitively by huggingface_hub's dataset loading path and handy for
+# ad-hoc inspection; not required by the pipeline modules themselves:
+# datasets, pandas
+#
+# Dev / tests:
+pytest>=8.0

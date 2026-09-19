@@ -1,0 +1,32 @@
+# Secrets
+.env
+
+# Data: raw and derived datasets are not committed (see DATASETS.md for
+# licensing/redistribution rationale; the pipeline regenerates everything).
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+data/final/*
+!data/final/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# Outputs / logs
+outputs/checkpoints/*
+outputs/logs/*
+!outputs/checkpoints/.gitkeep
+!outputs/logs/.gitkeep
+*.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
