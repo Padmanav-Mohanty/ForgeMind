@@ -1,0 +1,34 @@
+{
+  "seed": 42,
+  "ratios": {
+    "train": 0.8,
+    "validation": 0.1,
+    "test": 0.1
+  },
+  "sources": {
+    "aifaultbench": 1178,
+    "ghpr": 1490,
+    "defects4j": 853
+  },
+  "total": 3521,
+  "splits": {
+    "train": {
+      "examples": 2816,
+      "share": 0.7998
+    },
+    "validation": {
+      "examples": 353,
+      "share": 0.1003
+    },
+    "test": {
+      "examples": 352,
+      "share": 0.1
+    }
+  },
+  "group_leakage_detected": false,
+  "groups_per_split": {
+    "train": 2481,
+    "validation": 309,
+    "test": 310
+  }
+}
