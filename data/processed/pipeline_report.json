@@ -1,0 +1,121 @@
+{
+  "sources": [
+    "aifaultbench",
+    "ghpr",
+    "defects4j"
+  ],
+  "steps": [
+    {
+      "step": "convert:aifaultbench",
+      "exit_code": 0
+    },
+    {
+      "step": "convert:ghpr",
+      "exit_code": 0
+    },
+    {
+      "step": "convert:defects4j",
+      "exit_code": 0
+    },
+    {
+      "step": "normalize:aifaultbench",
+      "before": 1210,
+      "after": 1210
+    },
+    {
+      "step": "normalize:ghpr",
+      "before": 1500,
+      "after": 1500
+    },
+    {
+      "step": "normalize:defects4j",
+      "before": 854,
+      "after": 854
+    },
+    {
+      "step": "clean:aifaultbench",
+      "file": "data\\processed\\aifaultbench.jsonl",
+      "before": 1210,
+      "after": 1210,
+      "removed": 0,
+      "removal_reasons": {}
+    },
+    {
+      "step": "clean:ghpr",
+      "file": "data\\processed\\ghpr.jsonl",
+      "before": 1500,
+      "after": 1500,
+      "removed": 0,
+      "removal_reasons": {}
+    },
+    {
+      "step": "clean:defects4j",
+      "file": "data\\processed\\defects4j.jsonl",
+      "before": 854,
+      "after": 854,
+      "removed": 0,
+      "removal_reasons": {}
+    },
+    {
+      "step": "dedup:aifaultbench",
+      "file": "aifaultbench.jsonl",
+      "before": 1210,
+      "after": 1178,
+      "removed": 32,
+      "exact_removed": 0,
+      "near_removed": 32
+    },
+    {
+      "step": "dedup:ghpr",
+      "file": "ghpr.jsonl",
+      "before": 1500,
+      "after": 1490,
+      "removed": 10,
+      "exact_removed": 0,
+      "near_removed": 10
+    },
+    {
+      "step": "dedup:defects4j",
+      "file": "defects4j.jsonl",
+      "before": 854,
+      "after": 853,
+      "removed": 1,
+      "exact_removed": 0,
+      "near_removed": 1
+    }
+  ],
+  "split": {
+    "seed": 42,
+    "ratios": {
+      "train": 0.8,
+      "validation": 0.1,
+      "test": 0.1
+    },
+    "sources": {
+      "aifaultbench": 1178,
+      "ghpr": 1490,
+      "defects4j": 853
+    },
+    "total": 3521,
+    "splits": {
+      "train": {
+        "examples": 2816,
+        "share": 0.7998
+      },
+      "validation": {
+        "examples": 353,
+        "share": 0.1003
+      },
+      "test": {
+        "examples": 352,
+        "share": 0.1
+      }
+    },
+    "group_leakage_detected": false,
+    "groups_per_split": {
+      "train": 2481,
+      "validation": 309,
+      "test": 310
+    }
+  }
+}

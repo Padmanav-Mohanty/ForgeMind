@@ -1,0 +1,23 @@
+{
+  "aifaultbench": {
+    "file": "data\\processed\\aifaultbench.jsonl",
+    "before": 1210,
+    "after": 1210,
+    "removed": 0,
+    "removal_reasons": {}
+  },
+  "ghpr": {
+    "file": "data\\processed\\ghpr.jsonl",
+    "before": 1500,
+    "after": 1500,
+    "removed": 0,
+    "removal_reasons": {}
+  },
+  "defects4j": {
+    "file": "data\\processed\\defects4j.jsonl",
+    "before": 854,
+    "after": 854,
+    "removed": 0,
+    "removal_reasons": {}
+  }
+}

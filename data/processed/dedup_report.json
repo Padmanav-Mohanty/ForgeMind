@@ -1,0 +1,26 @@
+{
+  "aifaultbench": {
+    "file": "aifaultbench.jsonl",
+    "before": 1210,
+    "after": 1178,
+    "removed": 32,
+    "exact_removed": 0,
+    "near_removed": 32
+  },
+  "ghpr": {
+    "file": "ghpr.jsonl",
+    "before": 1500,
+    "after": 1490,
+    "removed": 10,
+    "exact_removed": 0,
+    "near_removed": 10
+  },
+  "defects4j": {
+    "file": "defects4j.jsonl",
+    "before": 854,
+    "after": 853,
+    "removed": 1,
+    "exact_removed": 0,
+    "near_removed": 1
+  }
+}
