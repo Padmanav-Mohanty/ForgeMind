@@ -11,22 +11,28 @@ How to run:
 
 from __future__ import annotations
 
+import inspect
 import json
 
 import pytest
 
 from src.training.benchmark import (
+    SWEEP_SEQ_LENGTHS,
     BenchmarkConfig,
     StepResult,
     build_length_sample,
+    compute_record_lengths,
     configure_padding,
     default_configs,
     environment_info,
     load_train_records,
+    phases_completed,
     render_result_summary,
     render_results_table,
+    render_sweep_table,
+    run_single_benchmark,
     save_benchmark_report,
-    training_step_passed,
+    sweep_configs,
 )
 from src.data.utils import PROJECT_ROOT, build_example
 
@@ -245,7 +251,7 @@ class TestConfigurePadding:
         import src.training.benchmark as bench
 
         assert callable(bench.configure_padding)
-        assert callable(bench.training_step_passed)
+        assert callable(bench.phases_completed)
 
 
 # --- VRAM reporting gate (pure logic, no GPU) --------------------------------
@@ -253,17 +259,17 @@ class TestConfigurePadding:
 
 class TestVramGate:
     def test_gate_requires_all_three_phases(self):
-        assert training_step_passed(
+        assert phases_completed(
             StepResult(forward="PASS", backward="PASS", training_step="PASS")
         )
         # any phase short of PASS invalidates the measurement
-        assert not training_step_passed(
+        assert not phases_completed(
             StepResult(forward="FAIL (CUDA OOM)", backward="SKIP", training_step="SKIP")
         )
-        assert not training_step_passed(
+        assert not phases_completed(
             StepResult(forward="PASS", backward="FAIL (CUDA OOM)", training_step="SKIP")
         )
-        assert not training_step_passed(StepResult())  # all SKIP: nothing ran
+        assert not phases_completed(StepResult())  # all SKIP: nothing ran
 
     def test_failed_run_withholds_peak_vram_in_summary(self):
         # the Colab failure mode: benchmark died before forward, yet a
@@ -288,7 +294,7 @@ class TestVramGate:
             },
         }
         text = render_result_summary(result)
-        assert "Peak VRAM: n/a (training phases did not complete)" in text
+        assert "Peak VRAM: n/a (required phases did not complete)" in text
         assert "Peak VRAM: 3.56 GB" not in text  # the load peak must not leak through
         assert "Note: training phases did not complete" in text
 
@@ -308,6 +314,111 @@ class TestVramGate:
             },
         }
         assert "Peak VRAM: 9.41 GB" in render_result_summary(result)
+
+
+# --- forward-pass sequence-length sweep (offline logic) ----------------------
+
+
+class TestSweep:
+    @pytest.fixture()
+    def records(self) -> list[dict]:
+        from src.data.utils import build_example
+
+        return [
+            build_example(
+                "word " * words,
+                "answer " * 20,
+                {"source": "test", "task": "debugging", "group_key": f"g{i}"},
+            )
+            for i, words in enumerate((40, 70, 110, 150, 200, 260, 320, 400))
+        ]
+
+    def test_sweep_lengths_are_512_to_1536(self):
+        assert SWEEP_SEQ_LENGTHS == (512, 768, 1024, 1280, 1536)
+
+    def test_sweep_configs_hold_everything_but_length_identical(self):
+        reference = BenchmarkConfig(max_seq_length=2048)
+        for config in sweep_configs():
+            assert config.batch_size == reference.batch_size == 1
+            assert config.packing is False
+            assert config.gradient_checkpointing is True
+            assert config.quantization == "4-bit"
+            assert (config.lora_r, config.lora_alpha) == (16, 32)
+
+    def test_sweep_configs_custom_lengths_preserve_order(self):
+        assert [c.max_seq_length for c in sweep_configs((256, 384))] == [256, 384]
+
+    def test_runner_defaults_to_full_phase_sequence(self):
+        signature = inspect.signature(run_single_benchmark)
+        assert signature.parameters["phases"].default == ("forward", "backward", "step")
+
+    def test_phases_completed_forward_only(self):
+        assert phases_completed(StepResult(forward="PASS"))  # sweep success shape
+        assert not phases_completed(StepResult(forward="FAIL (CUDA OOM)"))
+        # a FAIL anywhere invalidates, even with later phases SKIP
+        assert not phases_completed(
+            StepResult(forward="PASS", backward="FAIL (CUDA OOM)")
+        )
+
+    def test_phases_completed_requires_forward_unlike_skip_all(self):
+        assert not phases_completed(StepResult())  # nothing ran
+
+    def test_compute_record_lengths_matches_inline_computation(self, records):
+        from tests.tokenization.test_render_and_analysis import StubTokenizer
+
+        precomputed = compute_record_lengths(records, StubTokenizer())
+        sample_cached, report_cached = build_length_sample(
+            records, StubTokenizer(), 350, count=4, seed=42, precomputed=precomputed
+        )
+        sample_fresh, report_fresh = build_length_sample(
+            records, StubTokenizer(), 350, count=4, seed=42
+        )
+        assert sample_cached == sample_fresh
+        assert report_cached.to_dict() == report_fresh.to_dict()
+
+    def test_sweep_table_one_row_per_length(self):
+        def _row(length: int, *, forward: str, oom: bool, peak: float | None) -> dict:
+            config = BenchmarkConfig(max_seq_length=length)
+            return {
+                "config": vars(config) | {"label": config.label()},
+                "steps": {
+                    "forward": forward,
+                    "backward": "SKIP",
+                    "training_step": "SKIP",
+                    "cuda_oom": oom,
+                    "peak_vram_gb": peak,
+                    "step_time_seconds": None,
+                    "notes": [],
+                },
+            }
+
+        results = [
+            _row(512, forward="PASS", oom=False, peak=4.51),
+            _row(768, forward="PASS", oom=False, peak=4.98),
+            _row(1024, forward="FAIL (CUDA OOM)", oom=True, peak=None),
+        ]
+        table = render_sweep_table(results)
+        lines = table.strip().splitlines()
+        assert len(lines) == 5  # header, separator, three rows
+        assert "| 512 | 1 | PASS | NO | 4.51 |" in table
+        assert "| 1024 | 1 | FAIL (CUDA OOM) | YES | n/a |" in table
+
+    def test_sweep_table_withholds_vram_on_failed_forward(self):
+        config = BenchmarkConfig(max_seq_length=1536)
+        result = {
+            "config": vars(config) | {"label": config.label()},
+            "steps": {
+                "forward": "SKIP",
+                "backward": "SKIP",
+                "training_step": "SKIP",
+                "cuda_oom": False,
+                "peak_vram_gb": None,
+                "step_time_seconds": None,
+                "notes": ["error: something before forward"],
+            },
+        }
+        text = render_sweep_table([result])
+        assert "| 1536 | 1 | SKIP | NO | n/a |" in text
 
 
 # --- environment helpers (no GPU required, must not raise) ------------------

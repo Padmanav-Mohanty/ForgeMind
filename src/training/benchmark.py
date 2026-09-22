@@ -17,8 +17,10 @@ benchmark runner needs a GPU.
 
 Entry points:
     run_benchmark()       — full 2048 + 4096 benchmark on a GPU machine
+    run_sweep()           — forward-pass-only sweep across short lengths
     build_length_sample() — deterministic representative sample (pure)
     render_results_table()— markdown comparison table (pure)
+    render_sweep_table()  — markdown sweep table (pure)
 """
 
 from __future__ import annotations
@@ -40,6 +42,10 @@ DEFAULT_MODEL_ID = "meta-llama/Llama-3.2-3B-Instruct"
 BENCHMARK_SEED = 42
 WARMUP_STEPS = 1
 TIMED_STEPS = 3
+
+# Forward-pass sweep lengths: bracket where activations start to fit after
+# both primary caps (2048/4096) OOMed during forward on the first T4 run.
+SWEEP_SEQ_LENGTHS = (512, 768, 1024, 1280, 1536)
 
 # Llama 3.2 ships no pad token; padded batching needs one. Reusing the
 # model's EOS token adds no vocabulary entry, and left padding keeps the
@@ -83,6 +89,21 @@ def optional_batch2_configs() -> list[BenchmarkConfig]:
     return [BenchmarkConfig(max_seq_length=2048, batch_size=2)]
 
 
+def sweep_configs(seq_lengths: tuple[int, ...] | None = None) -> list[BenchmarkConfig]:
+    """Forward-pass feasibility sweep: find where 4-bit QLoRA fits at all.
+
+    Motivated by the first T4 run (forward OOM at both 2048 and 4096): the
+    open question becomes the largest sequence length whose forward pass
+    fits. Every variable except max_seq_length is held identical to the
+    primary matrix — batch 1, packing off, gradient checkpointing on, the
+    same 4-bit quantization and LoRA configuration.
+    """
+    return [
+        BenchmarkConfig(max_seq_length=length)
+        for length in (seq_lengths or SWEEP_SEQ_LENGTHS)
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Deterministic representative sample (pure — unit-testable, no tokenizer)
 # ---------------------------------------------------------------------------
@@ -114,12 +135,32 @@ class SampleReport:
         }
 
 
+def compute_record_lengths(
+    records: list[dict[str, Any]], tokenizer: Any
+) -> list[tuple[int, int, list[dict[str, str]]]]:
+    """Chat-template token length for every record, computed once.
+
+    The (index, token_count, conversation) triples are exactly the
+    intermediate representation `build_length_sample` consumes; callers that
+    sweep many sequence lengths pass them via `precomputed` so the dataset
+    is tokenized once instead of once per length.
+    """
+    lengths: list[tuple[int, int, list[dict[str, str]]]] = []
+    for index, record in enumerate(records):
+        conversation = extract_conversation(record)
+        if conversation is None:
+            continue
+        lengths.append((index, count_tokens(conversation, tokenizer), conversation))
+    return lengths
+
+
 def build_length_sample(
     records: list[dict[str, Any]],
     tokenizer: Any,
     max_seq_length: int,
     count: int = 4,
     seed: int = BENCHMARK_SEED,
+    precomputed: list[tuple[int, int, list[dict[str, str]]]] | None = None,
 ) -> tuple[list[dict[str, Any]], SampleReport]:
     """Deterministically pick `count` chat-template examples near the cap.
 
@@ -134,13 +175,15 @@ def build_length_sample(
 
     Examples over the cap are skipped (they will be trimmed or filtered
     before real training — that decision is separate from this benchmark).
+
+    `precomputed` accepts the output of `compute_record_lengths` so sweep
+    callers tokenize the dataset once for all sequence lengths; results are
+    identical to a fresh computation.
     """
-    lengths: list[tuple[int, int, list[dict[str, str]]]] = []
-    for index, record in enumerate(records):
-        conversation = extract_conversation(record)
-        if conversation is None:
-            continue
-        lengths.append((index, count_tokens(conversation, tokenizer), conversation))
+    if precomputed is not None:
+        lengths = precomputed
+    else:
+        lengths = compute_record_lengths(records, tokenizer)
 
     under_cap = [(i, n, c) for i, n, c in lengths if n <= max_seq_length]
     over_cap = len(lengths) - len(under_cap)
@@ -309,12 +352,17 @@ class StepResult:
         }
 
 
-def training_step_passed(steps: StepResult) -> bool:
-    """True only when forward, backward, AND the training step all PASS."""
+def phases_completed(steps: StepResult) -> bool:
+    """True only when every *enabled* phase PASSED (forward is mandatory).
+
+    The primary benchmark runs forward -> backward -> optimizer step; the
+    forward-only sweep legitimately leaves backward/step SKIP, so SKIP
+    counts as satisfied while any FAIL invalidates the measurement.
+    """
     return (
         steps.forward == "PASS"
-        and steps.backward == "PASS"
-        and steps.training_step == "PASS"
+        and steps.backward in ("PASS", "SKIP")
+        and steps.training_step in ("PASS", "SKIP")
     )
 
 
@@ -363,6 +411,7 @@ def run_single_benchmark(
     hf_token: str | None = None,
     verbose: bool = True,
     texts_override: list[str] | None = None,
+    phases: tuple[str, ...] = ("forward", "backward", "step"),
 ) -> dict[str, Any]:
     """Run one configuration end to end; returns its result dict.
 
@@ -374,6 +423,11 @@ def run_single_benchmark(
     the optional packing cell to feed one pre-packed long sequence);
     everything else — tokenization settings, labels, memory measurement —
     is identical.
+
+    `phases` selects the executed phases, in order. The default runs the
+    full forward → backward → optimizer-step sequence; the sequence-length
+    sweep passes ("forward",) so its VRAM numbers isolate the activation
+    footprint — the variable a sweep actually varies.
     """
     torch = _torch_imports()
     from peft import LoraConfig, prepare_model_for_kbit_training, get_peft_model
@@ -478,7 +532,7 @@ def run_single_benchmark(
             steps.notes.append("forward pass OOM")
 
         # ---- backward on the forward graph we already hold -----------------
-        if steps.forward == "PASS":
+        if steps.forward == "PASS" and "backward" in phases:
             try:
                 backward_start = time.perf_counter()
                 outputs.loss.backward()
@@ -495,7 +549,7 @@ def run_single_benchmark(
                 outputs = None  # the autograd graph must not outlive the phase
 
         # ---- optimizer step (the real training-step memory profile) -------
-        if steps.backward == "PASS":
+        if steps.backward == "PASS" and "step" in phases:
             try:
                 optimizer = torch.optim.AdamW(
                     [p for p in model.parameters() if p.requires_grad], lr=1e-4
@@ -528,7 +582,7 @@ def run_single_benchmark(
     except Exception as exc:  # noqa: BLE001 - report the failure cleanly
         steps.notes.append(f"error: {type(exc).__name__}: {exc}")
 
-    if training_step_passed(steps):
+    if phases_completed(steps):
         try:
             steps.peak_vram_gb = round(torch.cuda.max_memory_allocated(0) / 1024**3, 2)
         except Exception:  # noqa: BLE001
@@ -543,12 +597,12 @@ def run_single_benchmark(
         steps.peak_vram_gb = None
         if not steps.notes:
             steps.notes.append(
-                "training phases did not complete — Peak VRAM withheld "
+                "required phases did not complete — Peak VRAM withheld "
                 f"(weights-load peak was {load_peak} GB, not a training measurement)"
             )
 
     result["steps"] = steps.to_dict()
-    result["ok"] = training_step_passed(steps) and not steps.oom
+    result["ok"] = phases_completed(steps) and not steps.oom
 
     # ---- cleanup: always, so the next configuration starts clean ---------
     del model
@@ -558,6 +612,25 @@ def run_single_benchmark(
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats(0)
     return result
+
+
+def _load_tokenizer_with_padding(
+    tokenizer_id: str | None, hf_token: str | None, verbose: bool
+) -> tuple[Any, str, dict[str, Any]]:
+    """Resolve the configured tokenizer, load it, and apply pad configuration."""
+    from transformers import AutoTokenizer
+
+    tokenizer_id = tokenizer_id or load_config().get("tokenization", {}).get(
+        "tokenizer_id", DEFAULT_TOKENIZER_ID
+    )
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_id, token=hf_token)
+    padding_info = configure_padding(tokenizer)
+    if verbose:
+        print(
+            f"tokenizer: pad_token={padding_info['pad_token']!r} "
+            f"(id {padding_info['pad_token_id']}), padding_side={padding_info['padding_side']}"
+        )
+    return tokenizer, tokenizer_id, padding_info
 
 
 def run_benchmark(
@@ -570,12 +643,10 @@ def run_benchmark(
 ) -> dict[str, Any]:
     """Run the full benchmark matrix and return the complete result dict."""
     torch = _torch_imports()
-    from transformers import AutoTokenizer
 
     configs = configs if configs is not None else default_configs()
-    config_data = load_config()
-    tokenizer_id = tokenizer_id or config_data.get("tokenization", {}).get(
-        "tokenizer_id", DEFAULT_TOKENIZER_ID
+    tokenizer, tokenizer_id, padding_info = _load_tokenizer_with_padding(
+        tokenizer_id, hf_token, verbose
     )
 
     records = load_train_records()
@@ -585,13 +656,6 @@ def run_benchmark(
             "read-only sample of the real dataset to be meaningful."
         )
 
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_id, token=hf_token)
-    padding_info = configure_padding(tokenizer)
-    if verbose:
-        print(
-            f"tokenizer: pad_token={padding_info['pad_token']!r} "
-            f"(id {padding_info['pad_token_id']}), padding_side={padding_info['padding_side']}"
-        )
     results: list[dict[str, Any]] = []
     for config in configs:
         sample, sample_report = build_length_sample(
@@ -624,6 +688,78 @@ def run_benchmark(
     }
 
 
+def run_sweep(
+    seq_lengths: tuple[int, ...] | None = None,
+    model_id: str = DEFAULT_MODEL_ID,
+    tokenizer_id: str = DEFAULT_TOKENIZER_ID,
+    hf_token: str | None = None,
+    sample_count: int = 4,
+    verbose: bool = True,
+) -> dict[str, Any]:
+    """Forward-pass-only sweep across ascending sequence lengths (additive).
+
+    Same model, quantization, LoRA, batch size, padding, and seeded
+    near-cap/mid sample methodology as `run_benchmark` — but only the
+    forward phase executes, so each measurement isolates the activation
+    footprint (the variable a sequence sweep is actually probing). Every
+    result passes through the same VRAM gate: a number is reported only when
+    the forward pass completed, never the model-load peak.
+    """
+    torch = _torch_imports()
+
+    lengths = tuple(seq_lengths) if seq_lengths else SWEEP_SEQ_LENGTHS
+    tokenizer, tokenizer_id, padding_info = _load_tokenizer_with_padding(
+        tokenizer_id, hf_token, verbose
+    )
+
+    records = load_train_records()
+    if not records:
+        raise FileNotFoundError(
+            f"No training records at {TRAIN_PATH} — the sweep needs a "
+            "read-only sample of the real dataset to be meaningful."
+        )
+
+    # one tokenization pass over the dataset, reused by every sweep length
+    lengths_index = compute_record_lengths(records, tokenizer)
+
+    results: list[dict[str, Any]] = []
+    for length in lengths:
+        config = BenchmarkConfig(max_seq_length=length)
+        sample, sample_report = build_length_sample(
+            records, tokenizer, length, count=sample_count, seed=config.seed,
+            precomputed=lengths_index,
+        )
+        if verbose:
+            print(
+                f"\n=== {config.label()}: sample {sample_report.selected} "
+                f"({sample_report.selection}), "
+                f"sample lengths {sample_report.token_lengths['sample_min']}-"
+                f"{sample_report.token_lengths['sample_max']} ==="
+            )
+        outcome = run_single_benchmark(
+            config, tokenizer, sample, model_id=model_id, hf_token=hf_token,
+            verbose=verbose, phases=("forward",),
+        )
+        outcome["sample_report"] = sample_report.to_dict()
+        results.append(outcome)
+
+    return {
+        "model_id": model_id,
+        "tokenizer_id": tokenizer_id,
+        "padding": padding_info,
+        "environment": environment_info(),
+        "phases": ["forward"],
+        "results": results,
+        "dataset_read_only": True,
+        "note": (
+            "Read-only forward-pass sweep: no backward pass, no optimizer "
+            "execution, no dataset file was modified, and no training run "
+            "was performed. Peak VRAM is reported only for completed "
+            "forward passes."
+        ),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Renderers (pure — unit-testable)
 # ---------------------------------------------------------------------------
@@ -642,7 +778,7 @@ def render_result_summary(result: dict[str, Any]) -> str:
         (
             f"Peak VRAM: {steps['peak_vram_gb']} GB"
             if steps.get("peak_vram_gb") is not None
-            else "Peak VRAM: n/a (training phases did not complete)"
+            else "Peak VRAM: n/a (required phases did not complete)"
         ),
         f"CUDA OOM: {'YES' if steps.get('cuda_oom') else 'NO'}",
         f"Forward pass: {steps.get('forward')}",
@@ -681,6 +817,26 @@ def render_results_table(results: list[dict[str, Any]]) -> str:
     return "\n".join([header, *rows])
 
 
+def render_sweep_table(results: list[dict[str, Any]]) -> str:
+    """Markdown table for the forward-pass sweep: one row per sequence length."""
+    header = (
+        "| Seq Length | Batch | Forward | OOM | Peak VRAM (GB) |\n"
+        "|---:|---:|---|---|---:|"
+    )
+    rows = []
+    for result in results:
+        config = result["config"]
+        steps = result["steps"]
+        peak = steps.get("peak_vram_gb")
+        rows.append(
+            f"| {config['max_seq_length']} | {config['batch_size']} | "
+            f"{steps.get('forward')} | "
+            f"{'YES' if steps.get('cuda_oom') else 'NO'} | "
+            f"{peak if peak is not None else 'n/a'} |"
+        )
+    return "\n".join([header, *rows])
+
+
 def save_benchmark_report(report: dict[str, Any], path: Path | None = None) -> Path:
     """Persist the full machine-readable report next to the repo outputs."""
     path = path or PROJECT_ROOT / "outputs" / "logs" / "qlora_vram_benchmark_report.json"
@@ -700,6 +856,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--sample-count", type=int, default=4)
     parser.add_argument("--model", default=DEFAULT_MODEL_ID)
+    parser.add_argument(
+        "--sweep",
+        action="store_true",
+        help="forward-pass-only feasibility sweep (512-1536 by default); "
+        "locates where the forward pass fits when full configs OOM",
+    )
+    parser.add_argument(
+        "--sweep-lengths",
+        type=int,
+        nargs="+",
+        default=None,
+        help="override the sweep sequence lengths",
+    )
     parser.add_argument("--json", action="store_true", help="print the raw JSON report")
     args = parser.parse_args(argv)
 
@@ -711,22 +880,37 @@ def main(argv: list[str] | None = None) -> int:
 
     from src.data.utils import get_hf_token
 
-    configs = [
-        BenchmarkConfig(max_seq_length=length, batch_size=args.batch_size)
-        for length in args.seq_lengths
-    ]
-    report = run_benchmark(
-        configs=configs,
-        model_id=args.model,
-        hf_token=get_hf_token(),
-        sample_count=args.sample_count,
-    )
+    if args.sweep:
+        report = run_sweep(
+            seq_lengths=tuple(args.sweep_lengths) if args.sweep_lengths else None,
+            model_id=args.model,
+            hf_token=get_hf_token(),
+            sample_count=args.sample_count,
+        )
+    else:
+        configs = [
+            BenchmarkConfig(max_seq_length=length, batch_size=args.batch_size)
+            for length in args.seq_lengths
+        ]
+        report = run_benchmark(
+            configs=configs,
+            model_id=args.model,
+            hf_token=get_hf_token(),
+            sample_count=args.sample_count,
+        )
     report_path = save_benchmark_report(report)
     for result in report["results"]:
         print(render_result_summary(result))
         print()
-    print(render_results_table(report["results"]))
+    if args.sweep:
+        print(render_sweep_table(report["results"]))
+    else:
+        print(render_results_table(report["results"]))
     print(f"\nbenchmark: full report saved to {report_path}")
+    if args.sweep:
+        # finding OOM lengths is the sweep doing its job: the boundary
+        # between the largest PASS and the first OOM is the measurement
+        return 0
     return 0 if all(r["ok"] for r in report["results"]) else 1
 
 

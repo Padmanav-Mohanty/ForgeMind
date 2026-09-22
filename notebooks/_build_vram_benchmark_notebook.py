@@ -165,7 +165,9 @@ from src.training.benchmark import (
     optional_batch2_configs,
     render_result_summary,
     render_results_table,
+    render_sweep_table,
     run_benchmark,
+    run_sweep,
     save_benchmark_report,
 )
 
@@ -222,11 +224,43 @@ print(f"\\nEnvironment: {report_4096['environment'].get('gpu_name')} / "
       f"bitsandbytes {report_4096['environment'].get('bitsandbytes')}")
 print(f"\\nFull JSON report: {report_path}")
 print("Copy the summaries + table above back for the cap decision.")"""),
+    md("""### Sequence-length feasibility sweep — 512 / 768 / 1024 / 1280 / 1536
+
+After the primary matrix OOMed during **forward** at 2048 and 4096, the open
+question shifts to the largest sequence length whose forward pass fits at
+all. This sweep runs the **same forward-pass test** as the primary benchmark
+at five shorter lengths — every other variable held identical: batch size 1,
+packing off, gradient checkpointing on, the same 4-bit NF4 quantization and
+LoRA r16/α32 configuration, and the same seeded near-cap/mid sample
+methodology (tokenized once and reused across all lengths).
+
+**Forward-only by design:** no backward pass and no optimizer step execute,
+so each row isolates the activation footprint — the variable the sweep is
+actually probing. VRAM is reported **only when the forward phase completes**;
+a failed run shows `n/a`, never the model-load peak. The sweep is additive:
+the 2048/4096 results above remain valid, and the two tables read together
+give the full feasibility picture. Finding OOM lengths is a *successful*
+sweep — the boundary between the largest PASS and the first OOM is the
+measurement."""),
+    code("""# Cell 9 — Forward-pass feasibility sweep (512-1536)
+SWEEP_LENGTHS = (512, 768, 1024, 1280, 1536)
+
+sweep_report = run_sweep(
+    seq_lengths=SWEEP_LENGTHS, model_id=MODEL_ID, hf_token=HF_TOKEN, verbose=True
+)
+for result in sweep_report["results"]:
+    RESULTS[result["config"]["label"]] = result
+    print(render_result_summary(result))
+print("\\n" + render_sweep_table(sweep_report["results"]))
+print("\\nFull sweep JSON:", save_benchmark_report(
+    sweep_report,
+    path=Path("outputs/logs/qlora_vram_sweep_report.json"),
+))"""),
     md("""### Optional follow-ups (run only if the batch-1 tests passed)
 
 **Batch size 2** at 2048 — secondary question; the primary one is sequence
 feasibility. Set `RUN_OPTIONAL = True` to execute."""),
-    code("""# Cell 9 (optional) — batch size 2 at 2048
+    code("""# Cell 10 (optional) — batch size 2 at 2048
 RUN_OPTIONAL = False  # set True to run
 
 if RUN_OPTIONAL:
@@ -247,7 +281,7 @@ waste, but the worst-case per-sequence activation memory is what the
 non-packed run already exercises. The optional cell below measures a
 worst-case single **packed** sequence at each cap for completeness — keep it
 separate and do not mix its numbers into the non-packed table."""),
-    code("""# Cell 10 (optional) — packed worst-case single sequence per cap
+    code("""# Cell 11 (optional) — packed worst-case single sequence per cap
 RUN_PACKING = False  # set True to run
 
 if RUN_PACKING:
@@ -306,6 +340,15 @@ else:
 - **Batch size 1 is the decision-grade number.** Gradient accumulation
   changes effective batch size and wall-clock, not per-device VRAM — don't
   conflate them.
+- **Reading the sweep (512-1536):** rows are forward-pass-only, so their
+  Peak VRAM reflects 4-bit weights + LoRA + activations at that length —
+  subtract a sweep row's VRAM from the T4's usable ~15.6 GB to see how much
+  room remains for backward-pass workspace (gradients, checkpoint
+  re-computation, optimizer state). A length whose forward fits but whose
+  full benchmark OOMed in backward has no headroom for training at that
+  length. The useful boundary is the largest sweep length that PASSes —
+  lengths below it are comfortable, lengths above it do not fit even a
+  forward pass.
 - These results fill the last gap before setting `max_seq_length` in
   `configs/qlora.yaml`. The dataset-side facts already measured: train
   mean ≈ 1,423 tokens, p95 ≈ 3,255, p99 ≈ 5,210, max ≈ 25,642; at 2048,
@@ -328,7 +371,7 @@ should be fixed at the converter level in a separate, deliberate change.
 No dataset file was created, modified, filtered, or trimmed; `max_seq_length`
 in `configs/qlora.yaml` remains unset; no training run, checkpoint, or
 evaluation was performed."""),
-    code("""# Cell 11 — Final cleanup
+    code("""# Cell 12 — Final cleanup
 import gc, torch
 
 RESULTS.clear()

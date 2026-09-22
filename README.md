@@ -535,6 +535,14 @@ bootstraps and orchestrates. To run in Colab:
 The benchmark never modifies the dataset, never trims anything, and leaves
 `max_seq_length` unset — it only produces measurements for the cap decision.
 
+If the primary caps OOM during forward, the notebook's **feasibility sweep**
+(`run_sweep`, also `python scripts/colab_qlora_vram_benchmark.py --sweep`)
+runs the same forward-pass test at 512/768/1024/1280/1536 — every other
+variable identical — to locate the largest length whose forward pass fits.
+Sweep rows report VRAM only for completed forward passes and never execute
+backward/optimizer phases, so they isolate activation cost; finding OOM
+lengths is the sweep working, not a failure.
+
 ## Training Configuration
 
 `configs/qlora.yaml` is currently a **placeholder** — training
