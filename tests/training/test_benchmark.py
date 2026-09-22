@@ -17,14 +17,16 @@ import pytest
 
 from src.training.benchmark import (
     BenchmarkConfig,
-    SampleReport,
+    StepResult,
     build_length_sample,
+    configure_padding,
     default_configs,
     environment_info,
     load_train_records,
     render_result_summary,
     render_results_table,
     save_benchmark_report,
+    training_step_passed,
 )
 from src.data.utils import PROJECT_ROOT, build_example
 
@@ -179,6 +181,133 @@ class TestRenderers:
         report = {"results": [], "model_id": "m"}
         path = save_benchmark_report(report, path=tmp_path / "r.json")
         assert json.loads(path.read_text(encoding="utf-8"))["model_id"] == "m"
+
+
+# --- tokenizer padding configuration (offline, stub tokenizer) --------------
+
+
+class _LlamaLikeTokenizer:
+    """Mimics Llama 3.2's tokenizer: no pad token, an EOS token.
+
+    Mutable attributes like the real PreTrainedTokenizer, but no model
+    download and no network.
+    """
+
+    def __init__(self):
+        self.pad_token = None
+        self.pad_token_id = None
+        self.eos_token = "<|end_of_text|>"
+        self.eos_token_id = 128001
+        self.padding_side = "right"  # the HF default the benchmark must override
+
+
+class TestConfigurePadding:
+    def test_pad_token_set_to_eos(self):
+        tok = _LlamaLikeTokenizer()
+        info = configure_padding(tok)
+        assert tok.pad_token == tok.eos_token == "<|end_of_text|>"
+        assert tok.pad_token_id == tok.eos_token_id
+        assert info["pad_token_is_eos"] is True
+        assert info["pad_token_id"] == 128001
+
+    def test_padding_side_is_left(self):
+        tok = _LlamaLikeTokenizer()
+        info = configure_padding(tok)
+        assert tok.padding_side == "left"
+        assert info["padding_side"] == "left"
+
+    def test_explicit_pad_token_is_respected_not_overwritten(self):
+        tok = _LlamaLikeTokenizer()
+        tok.pad_token = "<|finetune_right_pad_id|>"
+        tok.pad_token_id = 128004
+        info = configure_padding(tok)
+        assert tok.pad_token == "<|finetune_right_pad_id|>"
+        assert info["pad_token_is_eos"] is False
+        assert tok.padding_side == "left"  # side is still forced
+
+    def test_neither_pad_nor_eos_raises_actionable_error(self):
+        tok = _LlamaLikeTokenizer()
+        tok.eos_token = None
+        tok.eos_token_id = None
+        with pytest.raises(ValueError, match="pad_token"):
+            configure_padding(tok)
+
+    def test_idempotent(self):
+        tok = _LlamaLikeTokenizer()
+        first = configure_padding(tok)
+        second = configure_padding(tok)
+        assert first == second
+        assert tok.pad_token == tok.eos_token
+
+    def test_benchmark_imports_without_cuda(self):
+        # regression guard for the lazy-import contract: the padding helpers
+        # must be reachable with no GPU and no torch import at module load
+        import src.training.benchmark as bench
+
+        assert callable(bench.configure_padding)
+        assert callable(bench.training_step_passed)
+
+
+# --- VRAM reporting gate (pure logic, no GPU) --------------------------------
+
+
+class TestVramGate:
+    def test_gate_requires_all_three_phases(self):
+        assert training_step_passed(
+            StepResult(forward="PASS", backward="PASS", training_step="PASS")
+        )
+        # any phase short of PASS invalidates the measurement
+        assert not training_step_passed(
+            StepResult(forward="FAIL (CUDA OOM)", backward="SKIP", training_step="SKIP")
+        )
+        assert not training_step_passed(
+            StepResult(forward="PASS", backward="FAIL (CUDA OOM)", training_step="SKIP")
+        )
+        assert not training_step_passed(StepResult())  # all SKIP: nothing ran
+
+    def test_failed_run_withholds_peak_vram_in_summary(self):
+        # the Colab failure mode: benchmark died before forward, yet a
+        # weights-load peak was reported as if it were a training measurement
+        config = BenchmarkConfig(max_seq_length=2048)
+        result = {
+            "config": vars(config) | {"label": config.label()},
+            "environment": {},
+            "steps": {
+                "forward": "SKIP",
+                "backward": "SKIP",
+                "training_step": "SKIP",
+                "cuda_oom": False,
+                "peak_vram_gb": None,
+                "step_time_seconds": None,
+                "notes": [
+                    "error: ValueError: Asking to pad but the tokenizer does "
+                    "not have a padding token",
+                    "training phases did not complete — Peak VRAM withheld "
+                    "(weights-load peak was 3.56 GB, not a training measurement)",
+                ],
+            },
+        }
+        text = render_result_summary(result)
+        assert "Peak VRAM: n/a (training phases did not complete)" in text
+        assert "Peak VRAM: 3.56 GB" not in text  # the load peak must not leak through
+        assert "Note: training phases did not complete" in text
+
+    def test_successful_run_still_reports_peak_vram(self):
+        result = {
+            "config": vars(BenchmarkConfig(max_seq_length=2048))
+            | {"label": "seq=2048 bs=1 pack=False"},
+            "environment": {},
+            "steps": {
+                "forward": "PASS",
+                "backward": "PASS",
+                "training_step": "PASS",
+                "cuda_oom": False,
+                "peak_vram_gb": 9.41,
+                "step_time_seconds": 1.2,
+                "notes": [],
+            },
+        }
+        assert "Peak VRAM: 9.41 GB" in render_result_summary(result)
 
 
 # --- environment helpers (no GPU required, must not raise) ------------------

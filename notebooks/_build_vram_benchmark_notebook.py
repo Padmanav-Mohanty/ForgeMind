@@ -159,6 +159,7 @@ comparable and one OOM cannot contaminate the next test."""),
     code("""# Cell 5 — Shared imports and the benchmark matrix
 from src.training.benchmark import (
     BenchmarkConfig,
+    configure_padding,
     default_configs,
     load_train_records,
     optional_batch2_configs,
@@ -206,6 +207,7 @@ for result in report_4096["results"]:
 report_path = save_benchmark_report(
     {
         "model_id": MODEL_ID,
+        "padding": report_4096.get("padding"),
         "environment": report_4096["environment"],
         "results": list(RESULTS.values()),
     }
@@ -251,11 +253,13 @@ RUN_PACKING = False  # set True to run
 if RUN_PACKING:
     from src.tokenization.render import extract_conversation
     from src.training.benchmark import (
-        BenchmarkConfig, build_length_sample, load_train_records, run_single_benchmark,
+        BenchmarkConfig, build_length_sample, configure_padding,
+        load_train_records, run_single_benchmark,
     )
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, token=HF_TOKEN)
+    configure_padding(tokenizer)  # EOS-as-pad + left padding BEFORE any padding=True call
     records = load_train_records()
     for cap in (2048, 4096):
         sample, _ = build_length_sample(records, tokenizer, cap, count=4)
@@ -283,7 +287,15 @@ else:
   configuration — model weights (4-bit ≈ ~2 GB for 3B), LoRA + optimizer
   state, and the largest activation footprint. Compare it against the T4's
   ~15.6 GB *usable*; leave headroom for fragmentation (allocator spikes above
-  the measured peak are normal on long sequences).
+  the measured peak are normal on long sequences). It is reported **only when
+  all three phases (forward, backward, optimizer step) PASS**; otherwise it
+  is withheld (`n/a`) — the counter at that point merely reflects the model
+  weights loading (~3.5 GB), which is not a training measurement.
+- **Padding** is configured before batching: Llama 3.2 ships no pad token,
+  so the tokenizer reuses EOS (`pad_token = eos_token`, no new vocabulary
+  entry) and pads on the **left**. Labels are masked via the attention mask,
+  not by token id, so the template's real `<|eot_id|>` turn separators stay
+  inside the loss. The report records this under its top-level `padding` key.
 - **OOM at a phase** says where the ceiling is: forward/backward OOM at 4096
   but PASS at 2048 means the cap decision is memory-bound; OOM only at the
   optimizer step means optimizer state is the marginal cost.

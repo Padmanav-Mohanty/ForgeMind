@@ -41,6 +41,11 @@ BENCHMARK_SEED = 42
 WARMUP_STEPS = 1
 TIMED_STEPS = 3
 
+# Llama 3.2 ships no pad token; padded batching needs one. Reusing the
+# model's EOS token adds no vocabulary entry, and left padding keeps the
+# real (loss-bearing) positions at the end of each row.
+DEFAULT_PADDING_SIDE = "left"
+
 
 # ---------------------------------------------------------------------------
 # Benchmark configuration
@@ -304,6 +309,46 @@ class StepResult:
         }
 
 
+def training_step_passed(steps: StepResult) -> bool:
+    """True only when forward, backward, AND the training step all PASS."""
+    return (
+        steps.forward == "PASS"
+        and steps.backward == "PASS"
+        and steps.training_step == "PASS"
+    )
+
+
+def configure_padding(tokenizer: Any) -> dict[str, Any]:
+    """Make the tokenizer batch-capable: EOS as pad token, left padding.
+
+    Llama 3.2 ships without a pad token, so any `padding=True` call raises
+    "Asking to pad but the tokenizer does not have a padding token" until one
+    is set. Reusing the model's EOS token avoids adding a new vocabulary
+    entry (and a new, randomly initialized embedding row). Left padding keeps
+    real tokens flush against the end of each row, which is what
+    completion-masked causal training expects.
+
+    Idempotent; MUST run before any tokenization call that requests padding.
+    Returns the effective configuration for logging and the report.
+    """
+    if getattr(tokenizer, "pad_token", None) is None:
+        if tokenizer.eos_token is None:
+            raise ValueError(
+                "Tokenizer has neither a pad_token nor an eos_token; cannot "
+                "enable padded batching. Set tokenizer.pad_token explicitly."
+            )
+        tokenizer.pad_token = tokenizer.eos_token
+    if getattr(tokenizer, "pad_token_id", None) is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    tokenizer.padding_side = DEFAULT_PADDING_SIDE
+    return {
+        "pad_token": tokenizer.pad_token,
+        "pad_token_id": tokenizer.pad_token_id,
+        "padding_side": tokenizer.padding_side,
+        "pad_token_is_eos": tokenizer.pad_token == tokenizer.eos_token,
+    }
+
+
 def _torch_imports():
     import torch
 
@@ -398,8 +443,9 @@ def run_single_benchmark(
                         conversation, tokenize=False, add_generation_prompt=False
                     )
                 )
-        pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
-        tokenizer.padding_side = "left"  # pad the front: loss positions stay at the end
+        # Llama 3.2 has no pad token: reuse EOS and force left padding
+        # BEFORE any call that requests padding (the exact failure Colab hit).
+        padding_info = configure_padding(tokenizer)
         encodings = tokenizer(
             texts,
             return_tensors="pt",
@@ -410,10 +456,12 @@ def run_single_benchmark(
         input_ids = encodings["input_ids"].to("cuda")
         attention_mask = encodings["attention_mask"].to("cuda")
         labels = input_ids.clone()
-        labels[labels == pad_id] = -100  # never train on padding
+        # pad token == EOS, so mask via the attention mask — masking by token
+        # id would also erase the template's real <|eot_id|> turn separators
+        labels[attention_mask == 0] = -100  # never train on padding
         log(
             f"[{config.label()}] batch: {input_ids.shape[0]} x {input_ids.shape[1]} tokens "
-            f"(pad token {pad_id})"
+            f"(pad token {padding_info['pad_token']!r}, side {padding_info['padding_side']})"
         )
 
         # ---- forward ------------------------------------------------------
@@ -480,14 +528,27 @@ def run_single_benchmark(
     except Exception as exc:  # noqa: BLE001 - report the failure cleanly
         steps.notes.append(f"error: {type(exc).__name__}: {exc}")
 
-    try:
-        peak = torch.cuda.max_memory_allocated(0) / 1024**3
-        steps.peak_vram_gb = round(peak, 2)
-    except Exception:  # noqa: BLE001
+    if training_step_passed(steps):
+        try:
+            steps.peak_vram_gb = round(torch.cuda.max_memory_allocated(0) / 1024**3, 2)
+        except Exception:  # noqa: BLE001
+            steps.peak_vram_gb = None
+    else:
+        # The counter still holds the weights-load peak (~3.5 GB for this
+        # model) — reporting it as Peak VRAM would fake a successful run.
+        try:
+            load_peak = round(torch.cuda.max_memory_allocated(0) / 1024**3, 2)
+        except Exception:  # noqa: BLE001
+            load_peak = None
         steps.peak_vram_gb = None
+        if not steps.notes:
+            steps.notes.append(
+                "training phases did not complete — Peak VRAM withheld "
+                f"(weights-load peak was {load_peak} GB, not a training measurement)"
+            )
 
     result["steps"] = steps.to_dict()
-    result["ok"] = (not steps.oom) and steps.training_step == "PASS"
+    result["ok"] = training_step_passed(steps) and not steps.oom
 
     # ---- cleanup: always, so the next configuration starts clean ---------
     del model
@@ -525,6 +586,12 @@ def run_benchmark(
         )
 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_id, token=hf_token)
+    padding_info = configure_padding(tokenizer)
+    if verbose:
+        print(
+            f"tokenizer: pad_token={padding_info['pad_token']!r} "
+            f"(id {padding_info['pad_token_id']}), padding_side={padding_info['padding_side']}"
+        )
     results: list[dict[str, Any]] = []
     for config in configs:
         sample, sample_report = build_length_sample(
@@ -546,6 +613,7 @@ def run_benchmark(
     return {
         "model_id": model_id,
         "tokenizer_id": tokenizer_id,
+        "padding": padding_info,
         "environment": environment_info(),
         "results": results,
         "dataset_read_only": True,
@@ -571,7 +639,11 @@ def render_result_summary(result: dict[str, Any]) -> str:
         f"Batch size: {config['batch_size']}",
         f"Quantization: {config.get('quantization', '4-bit')}",
         f"Gradient checkpointing: {'enabled' if config.get('gradient_checkpointing') else 'disabled'}",
-        f"Peak VRAM: {steps.get('peak_vram_gb')} GB",
+        (
+            f"Peak VRAM: {steps['peak_vram_gb']} GB"
+            if steps.get("peak_vram_gb") is not None
+            else "Peak VRAM: n/a (training phases did not complete)"
+        ),
         f"CUDA OOM: {'YES' if steps.get('cuda_oom') else 'NO'}",
         f"Forward pass: {steps.get('forward')}",
         f"Backward pass: {steps.get('backward')}",
