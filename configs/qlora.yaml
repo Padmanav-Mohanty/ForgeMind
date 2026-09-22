@@ -1,0 +1,18 @@
+# ForgeMind QLoRA training configuration — PLACEHOLDER.
+#
+# Training hyperparameters (learning rate, batch size, epochs, LoRA
+# rank/alpha/target modules, warmup, optimizer, scheduler) are NOT finalized.
+# They will be documented here once the training stage is implemented.
+#
+# The single setting below is the training sequence-length cap. It is
+# deliberately left unset: the value must be chosen after reviewing
+#   - data/final/token_length_report.json (measured token statistics), and
+#   - the GPU available for training (Google Colab).
+# Set it to an integer (e.g. 2048) once decided; the training code must read
+# it from here rather than hard-coding it.
+
+# Maximum tokenized sequence length per example (prompt + completion,
+# including special tokens). Examples longer than this are never silently
+# truncated: handle them explicitly (filter / split / shorten) based on the
+# token-length analysis before training.
+max_seq_length: null
