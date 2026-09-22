@@ -25,6 +25,7 @@ from src.training.benchmark import (
     configure_padding,
     default_configs,
     environment_info,
+    focused_full_step_config,
     load_train_records,
     phases_completed,
     render_result_summary,
@@ -419,6 +420,43 @@ class TestSweep:
         }
         text = render_sweep_table([result])
         assert "| 1536 | 1 | SKIP | NO | n/a |" in text
+
+
+# --- focused full-step probe at the forward ceiling (offline logic) ----------
+
+
+class TestFocusedFullStep:
+    def test_config_is_1024_with_benchmark_defaults(self):
+        config = focused_full_step_config()
+        assert config.max_seq_length == 1024
+        assert config.batch_size == 1
+        assert config.packing is False
+        assert config.gradient_checkpointing is True
+        assert config.quantization == "4-bit"
+        assert (config.lora_r, config.lora_alpha) == (16, 32)
+
+    def test_config_is_deterministic_and_immutable_default(self):
+        assert focused_full_step_config() == BenchmarkConfig(max_seq_length=1024)
+
+    def test_probe_runs_the_full_three_phase_sequence(self):
+        # the probe's whole point is forward + backward + optimizer step;
+        # the runner must default to all three phases for it
+        signature = inspect.signature(run_single_benchmark)
+        assert signature.parameters["phases"].default == (
+            "forward",
+            "backward",
+            "step",
+        )
+
+    def test_full_step_result_only_counts_when_all_three_pass(self):
+        # a backward OOM after a forward PASS must NOT count as a successful
+        # probe: the gate requires every executed phase to PASS
+        assert phases_completed(
+            StepResult(forward="PASS", backward="PASS", training_step="PASS")
+        )
+        assert not phases_completed(
+            StepResult(forward="PASS", backward="FAIL (CUDA OOM)", training_step="SKIP")
+        )
 
 
 # --- environment helpers (no GPU required, must not raise) ------------------

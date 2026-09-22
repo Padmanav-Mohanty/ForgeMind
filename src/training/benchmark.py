@@ -104,6 +104,21 @@ def sweep_configs(seq_lengths: tuple[int, ...] | None = None) -> list[BenchmarkC
     ]
 
 
+def focused_full_step_config() -> BenchmarkConfig:
+    """Focused probe: can full training actually run at the sweep's ceiling?
+
+    The T4 sweep measured forward PASS up to 1024 tokens (OOM from 1280 up).
+    Forward fitting is necessary but not sufficient: backward needs gradient
+    workspace and re-computed activations, and the optimizer step adds
+    adapter optimizer state. This probe runs the complete forward → backward
+    → optimizer-step sequence at 1024 with every other variable at the
+    benchmark defaults (batch 1, packing off, gradient checkpointing on,
+    same 4-bit quantization and LoRA configuration) and reports each phase
+    separately — peak VRAM is printed only when all three phases complete.
+    """
+    return BenchmarkConfig(max_seq_length=1024)
+
+
 # ---------------------------------------------------------------------------
 # Deterministic representative sample (pure — unit-testable, no tokenizer)
 # ---------------------------------------------------------------------------

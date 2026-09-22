@@ -161,6 +161,7 @@ from src.training.benchmark import (
     BenchmarkConfig,
     configure_padding,
     default_configs,
+    focused_full_step_config,
     load_train_records,
     optional_batch2_configs,
     render_result_summary,
@@ -256,11 +257,36 @@ print("\\nFull sweep JSON:", save_benchmark_report(
     sweep_report,
     path=Path("outputs/logs/qlora_vram_sweep_report.json"),
 ))"""),
+    md("""### Focused probe — full training step at seq 1024
+
+The sweep measured forward **PASS** through 1024 and OOM from 1280 up, but a
+forward pass fitting is necessary, not sufficient: backward needs gradient
+workspace plus re-computed activations, and the optimizer step adds adapter
+optimizer state. This probe runs the **complete forward → backward →
+optimizer-step sequence** at 1024 with every other variable identical —
+batch 1, packing off, gradient checkpointing on, the same 4-bit NF4
+quantization and LoRA r16/α32 — through the exact runner and seeded sample
+methodology of the primary benchmark. Each phase reports separately; peak
+VRAM is printed **only when all three phases complete** — a backward or
+optimizer OOM is reported as such, never masked. It refines the sweep's 1024
+row into the decision number."""),
+    code("""# Cell 10 — Focused full-step probe: seq 1024, forward + backward + optimizer
+probe_report = run_benchmark(
+    configs=[focused_full_step_config()],
+    model_id=MODEL_ID, hf_token=HF_TOKEN, verbose=True,
+)
+for result in probe_report["results"]:
+    RESULTS[result["config"]["label"]] = result
+    print(render_result_summary(result))
+print("\\nProbe JSON:", save_benchmark_report(
+    probe_report,
+    path=Path("outputs/logs/qlora_vram_focused_1024_report.json"),
+))"""),
     md("""### Optional follow-ups (run only if the batch-1 tests passed)
 
 **Batch size 2** at 2048 — secondary question; the primary one is sequence
 feasibility. Set `RUN_OPTIONAL = True` to execute."""),
-    code("""# Cell 10 (optional) — batch size 2 at 2048
+    code("""# Cell 11 (optional) — batch size 2 at 2048
 RUN_OPTIONAL = False  # set True to run
 
 if RUN_OPTIONAL:
@@ -281,7 +307,7 @@ waste, but the worst-case per-sequence activation memory is what the
 non-packed run already exercises. The optional cell below measures a
 worst-case single **packed** sequence at each cap for completeness — keep it
 separate and do not mix its numbers into the non-packed table."""),
-    code("""# Cell 11 (optional) — packed worst-case single sequence per cap
+    code("""# Cell 12 (optional) — packed worst-case single sequence per cap
 RUN_PACKING = False  # set True to run
 
 if RUN_PACKING:
@@ -349,6 +375,11 @@ else:
   length. The useful boundary is the largest sweep length that PASSes —
   lengths below it are comfortable, lengths above it do not fit even a
   forward pass.
+- **The focused 1024 probe is the decision number.** It converts the
+  sweep's forward-only boundary into the full-step verdict at that length:
+  all three phases PASS means 1024 (with over-cap trimming) is the only cap
+  the T4 supports as-is; a backward OOM means even 1024 cannot *train* under
+  the intended stack, and the stack assumptions (not the cap) need revisiting.
 - These results fill the last gap before setting `max_seq_length` in
   `configs/qlora.yaml`. The dataset-side facts already measured: train
   mean ≈ 1,423 tokens, p95 ≈ 3,255, p99 ≈ 5,210, max ≈ 25,642; at 2048,
@@ -371,7 +402,7 @@ should be fixed at the converter level in a separate, deliberate change.
 No dataset file was created, modified, filtered, or trimmed; `max_seq_length`
 in `configs/qlora.yaml` remains unset; no training run, checkpoint, or
 evaluation was performed."""),
-    code("""# Cell 12 — Final cleanup
+    code("""# Cell 13 — Final cleanup
 import gc, torch
 
 RESULTS.clear()

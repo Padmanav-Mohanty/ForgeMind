@@ -541,7 +541,11 @@ runs the same forward-pass test at 512/768/1024/1280/1536 — every other
 variable identical — to locate the largest length whose forward pass fits.
 Sweep rows report VRAM only for completed forward passes and never execute
 backward/optimizer phases, so they isolate activation cost; finding OOM
-lengths is the sweep working, not a failure.
+lengths is the sweep working, not a failure. Once the sweep finds the largest
+forward-feasible length, the **focused full-step probe**
+(`focused_full_step_config()`, notebook Cell 10) runs the complete
+forward → backward → optimizer-step sequence at that length — all three
+phases must PASS before a Peak VRAM is reported.
 
 ## Training Configuration
 
